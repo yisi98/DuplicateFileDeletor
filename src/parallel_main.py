@@ -1,5 +1,5 @@
 import os
-import hashlib
+import xxhash  # Changed from hashlib
 import pandas as pd
 from tqdm import tqdm
 from loguru import logger
@@ -10,16 +10,16 @@ ALL_FILES_CSV = 'all_files.csv'
 DEDUP_CSV = 'deduplicated_files.csv'
 DELETED_CSV = 'deleted_files.csv'
 
-def get_md5(file_path, chunk_size=8192):
-    hash_md5 = hashlib.md5()
+def get_xxhash(file_path, chunk_size=8192):
+    h = xxhash.xxh64()  # 64-bit hash
     try:
         with open(file_path, "rb") as f:
             for chunk in iter(lambda: f.read(chunk_size), b""):
-                hash_md5.update(chunk)
+                h.update(chunk)
     except Exception as e:
         logger.warning(f"Failed to read {file_path}: {e}")
         return None
-    return hash_md5.hexdigest()
+    return h.hexdigest()
 
 def save_checkpoint_batch(batch_df, batch_index):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -40,21 +40,21 @@ def process_folder(root_dir):
         try:
             size = os.path.getsize(path)
             created = os.path.getctime(path)
-            md5 = get_md5(path)
-            if md5:
-                batch.append((path, size, md5, created))
+            file_hash = get_xxhash(path)
+            if file_hash:
+                batch.append((path, size, file_hash, created))
         except Exception as e:
             logger.warning(f"Error processing {path}: {e}")
             continue
 
         if len(batch) == CHECKPOINT_INTERVAL:
-            df = pd.DataFrame(batch, columns=["file_path", "file_size", "md5", "created_time"])
+            df = pd.DataFrame(batch, columns=["file_path", "file_size", "xxhash", "created_time"])
             save_checkpoint_batch(df, batch_index)
             batch = []
             batch_index += 1
 
     if batch:
-        df = pd.DataFrame(batch, columns=["file_path", "file_size", "md5", "created_time"])
+        df = pd.DataFrame(batch, columns=["file_path", "file_size", "xxhash", "created_time"])
         save_checkpoint_batch(df, batch_index)
 
     # Combine all checkpoints
@@ -75,13 +75,13 @@ def delete_duplicates(df):
     dedup_rows = []
     deleted_rows = []
 
-    grouped = df.groupby("md5")
+    grouped = df.groupby("xxhash")
 
     total_duplicates = 0
     total_kept = 0
     total_deleted = 0
 
-    for md5, group in grouped:
+    for _, group in grouped:
         if len(group) == 1:
             dedup_rows.append(group)
             continue
