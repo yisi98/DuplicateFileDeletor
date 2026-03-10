@@ -1,0 +1,10 @@
+/target
+/output
+/checkpoints
+*.csv
+*.log
+.idea/
+.venv/
+__pycache__/
+.DS_Store
+Thumbs.db
