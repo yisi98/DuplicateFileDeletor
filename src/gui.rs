@@ -73,45 +73,60 @@ impl eframe::App for DedupeApp {
         self.poll_background_messages();
         ctx.request_repaint_after(std::time::Duration::from_millis(150));
 
-        egui::TopBottomPanel::top("hero").show(ctx, |ui| {
-            Frame::new()
-                .fill(Color32::from_rgb(18, 24, 38))
-                .inner_margin(Margin::same(18))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new("DuplicateFileDeletor")
-                                    .size(28.0)
-                                    .strong()
-                                    .color(Color32::from_rgb(240, 244, 255)),
-                            );
-                            ui.label(
-                                RichText::new("Desktop deduplication with review-first safety.")
+        egui::TopBottomPanel::top("hero")
+            .frame(Frame::new().fill(Color32::from_rgb(7, 10, 16)))
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(Color32::from_rgb(18, 24, 38))
+                    .inner_margin(Margin::same(18))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new("DuplicateFileDeletor")
+                                        .size(28.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(240, 244, 255)),
+                                );
+                                ui.label(
+                                    RichText::new(
+                                        "Desktop deduplication with review-first safety.",
+                                    )
                                     .size(13.5)
                                     .color(Color32::from_rgb(150, 170, 192)),
-                            );
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            status_chip(
-                                ui,
-                                if self.active_run.is_some() {
-                                    "Running"
-                                } else {
-                                    "Ready"
-                                },
-                            );
+                                );
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                status_chip(
+                                    ui,
+                                    if self.active_run.is_some() {
+                                        "Running"
+                                    } else {
+                                        "Ready"
+                                    },
+                                );
+                            });
                         });
                     });
-                });
-        });
+            });
 
         egui::SidePanel::left("controls")
             .resizable(false)
             .default_width(360.0)
+            .frame(
+                Frame::new()
+                    .fill(Color32::from_rgb(7, 10, 16))
+                    .inner_margin(Margin::same(8)),
+            )
             .show(ctx, |ui| self.render_controls(ui));
 
-        egui::CentralPanel::default().show(ctx, |ui| self.render_results(ui));
+        egui::CentralPanel::default()
+            .frame(
+                Frame::new()
+                    .fill(Color32::from_rgb(7, 10, 16))
+                    .inner_margin(Margin::same(8)),
+            )
+            .show(ctx, |ui| self.render_results(ui));
     }
 }
 
@@ -492,14 +507,30 @@ fn configure_theme(ctx: &egui::Context) {
     style.spacing.item_spacing = Vec2::new(12.0, 12.0);
     style.spacing.button_padding = Vec2::new(14.0, 10.0);
     style.visuals = egui::Visuals::dark();
-    style.visuals.panel_fill = Color32::from_rgb(11, 15, 23);
+    style.visuals.override_text_color = Some(Color32::from_rgb(232, 238, 247));
+    style.visuals.panel_fill = Color32::from_rgb(7, 10, 16);
     style.visuals.window_fill = Color32::from_rgb(11, 15, 23);
-    style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(18, 24, 38);
-    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(22, 30, 47);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(32, 43, 67);
-    style.visuals.widgets.active.bg_fill = Color32::from_rgb(42, 58, 87);
-    style.visuals.extreme_bg_color = Color32::from_rgb(7, 10, 16);
+    style.visuals.faint_bg_color = Color32::from_rgb(13, 18, 29);
+    style.visuals.extreme_bg_color = Color32::from_rgb(4, 7, 12);
+    style.visuals.window_stroke = Stroke::new(1.0, Color32::from_rgb(32, 41, 58));
     style.visuals.selection.bg_fill = Color32::from_rgb(58, 128, 196);
+    style.visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(230, 240, 255));
+    style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(18, 24, 38);
+    style.visuals.widgets.noninteractive.weak_bg_fill = Color32::from_rgb(18, 24, 38);
+    style.visuals.widgets.noninteractive.fg_stroke =
+        Stroke::new(1.0, Color32::from_rgb(166, 182, 204));
+    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(22, 30, 47);
+    style.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(22, 30, 47);
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(232, 238, 247));
+    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(32, 43, 67);
+    style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(32, 43, 67);
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(245, 248, 255));
+    style.visuals.widgets.active.bg_fill = Color32::from_rgb(42, 58, 87);
+    style.visuals.widgets.active.weak_bg_fill = Color32::from_rgb(42, 58, 87);
+    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(245, 248, 255));
+    style.visuals.widgets.open.bg_fill = Color32::from_rgb(28, 38, 58);
+    style.visuals.widgets.open.weak_bg_fill = Color32::from_rgb(28, 38, 58);
+    style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, Color32::from_rgb(232, 238, 247));
     ctx.set_style(style);
 }
 
@@ -510,7 +541,12 @@ fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
         .stroke(Stroke::new(1.0, Color32::from_rgb(38, 48, 68)))
         .inner_margin(Margin::same(16))
         .show(ui, |ui| {
-            ui.label(RichText::new(title).size(16.0).strong());
+            ui.label(
+                RichText::new(title)
+                    .size(16.0)
+                    .strong()
+                    .color(Color32::from_rgb(236, 240, 248)),
+            );
             ui.add_space(10.0);
             add(ui);
         });
@@ -609,7 +645,7 @@ fn info_pill(ui: &mut egui::Ui, text: String) {
         .corner_radius(CornerRadius::same(32))
         .inner_margin(Margin::symmetric(12, 7))
         .show(ui, |ui| {
-            ui.label(text);
+            ui.label(RichText::new(text).color(Color32::from_rgb(210, 221, 239)));
         });
 }
 
