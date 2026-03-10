@@ -24,7 +24,7 @@ struct ActiveRun {
 
 enum UiMessage {
     Progress(ProgressUpdate),
-    Finished(Result<RunArtifacts, String>, RunConfig),
+    Finished(Box<Result<RunArtifacts, String>>, RunConfig),
 }
 
 #[derive(Clone)]
@@ -364,7 +364,7 @@ impl DedupeApp {
                             let _ = tx.send(UiMessage::Progress(update));
                         })
                         .map_err(|error| error.to_string());
-                    let _ = tx.send(UiMessage::Finished(result, config_for_thread));
+                    let _ = tx.send(UiMessage::Finished(Box::new(result), config_for_thread));
                 });
                 self.status_message = match mode {
                     OperationMode::DryRun => "Planning duplicates...".to_string(),
@@ -397,7 +397,7 @@ impl DedupeApp {
                 let _ = tx.send(UiMessage::Progress(update));
             })
             .map_err(|error| error.to_string());
-            let _ = tx.send(UiMessage::Finished(result, config_for_thread));
+            let _ = tx.send(UiMessage::Finished(Box::new(result), config_for_thread));
         });
         self.status_message = "Applying current plan...".to_string();
         self.latest_progress = None;
@@ -465,7 +465,7 @@ impl DedupeApp {
                 }
                 UiMessage::Finished(result, config) => {
                     finished = true;
-                    match result {
+                    match *result {
                         Ok(artifacts) => {
                             self.status_message = format!(
                                 "Finished in {:.1}s. Reports saved to {}",
