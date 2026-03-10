@@ -1,125 +1,80 @@
 # DuplicateFileDeletor
 
-`DuplicateFileDeletor` is a Rust CLI for scanning a directory tree, identifying duplicate files by content, and producing reviewable deletion plans. It now defaults to a safe dry-run workflow and only removes files when you explicitly pass `--apply`.
+`DuplicateFileDeletor` is now a native Rust desktop app for finding duplicate files, reviewing the deletion plan visually, and applying changes without using command prompts. The app defaults to a safe dry-run workflow and only deletes files when you explicitly choose an apply action.
 
-The repo also keeps two older Python prototypes in [legacy/main.py](/C:/Users/liuyisi/PycharmProjects/DuplicateFileDeletor/legacy/main.py) and [legacy/parallel_main.py](/C:/Users/liuyisi/PycharmProjects/DuplicateFileDeletor/legacy/parallel_main.py), but the Rust binary is the maintained path.
+## What Changed
 
-## Highlights
-
-- Safe by default: dry-run unless `--apply` is provided
-- Resume-friendly checkpoints stored under an output directory
-- Byte-for-byte verification before any deletion, even after hash matching
-- Configurable keep rules: `oldest-created`, `newest-modified`, `prefer-path`
-- Repeatable include/exclude path filters
-- CSV reports for scanned files, kept files, and planned or completed deletions
-- Unit tests, CI, `.gitignore`, license, and sample fixture data
-
-## How It Works
-
-1. Walk the target directory recursively.
-2. Skip anything filtered out by `--include` or `--exclude`.
-3. Hash file contents with `xxh3`.
-4. Save progress in checkpoint CSV batches.
-5. Group candidates by file size and hash.
-6. Verify candidate duplicates byte-for-byte.
-7. Keep one file per verified duplicate set according to the selected keep rule.
-8. Write reports and optionally delete the remaining duplicates.
-
-## Safety Model
-
-The CLI now uses a two-step workflow:
-
-- Dry-run: creates reports only
-- Apply: deletes files listed in the planned deletion set
-
-That means the recommended flow is:
+The primary experience is now a GUI launched with:
 
 ```bash
-cargo run -- --path C:\Users\you\Pictures
-cargo run -- --path C:\Users\you\Pictures --output-dir output\20260310_120000 --resume --apply
+cargo run
 ```
 
-The first command generates a deletion plan. The second resumes the same run and applies it after review.
+The desktop app provides:
 
-## Installation
+- Native folder pickers for the scan root, output folder, and preferred keep path
+- A review-first workflow with a dedicated dry-run action
+- Progress updates while scanning, planning, and deleting
+- A modern dashboard with summary cards and an in-app review list
+- One-click access to the scanned folder and generated reports
+- Reusable checkpoint/output folders so you can dry-run first and apply the same plan later
 
-You need a Rust toolchain with Cargo installed.
+A CLI is still available as a secondary entry point:
 
 ```bash
-cargo build
+cargo run --bin cli -- --path C:\Users\you\Pictures
 ```
 
-## Usage
+## Desktop Workflow
 
-```bash
-cargo run -- --path <directory> [options]
-```
+1. Launch the app with `cargo run`.
+2. Pick the folder you want to scan.
+3. Choose where reports and checkpoints should be stored.
+4. Select how duplicates should be kept:
+   - oldest created
+   - newest modified
+   - prefer a specific folder
+5. Optionally add include or exclude filters.
+6. Click `Plan Safe Dry Run`.
+7. Review the planned deletions inside the app.
+8. Click `Apply Current Plan` when you are satisfied.
 
-You can also pass the directory positionally:
+## Features
 
-```bash
-cargo run -- C:\Users\you\Pictures
-```
-
-### Common Options
-
-- `--apply`: actually delete duplicate files
-- `--dry-run`: plan only; this is the default
-- `--output-dir <dir>`: where reports and checkpoints are written
-- `--resume`: continue a previous run from checkpoint data in `--output-dir`
-- `--keep <rule>`: `oldest-created`, `newest-modified`, or `prefer-path`
-- `--prefer-path <dir>`: preferred directory when `--keep prefer-path` is used
-- `--include <text>`: only scan paths containing this text; repeatable
-- `--exclude <text>`: skip paths containing this text; repeatable
-- `--help`: print CLI help
-
-### Examples
-
-Dry-run a folder:
-
-```bash
-cargo run -- --path C:\Users\you\Pictures
-```
-
-Delete duplicates and keep the newest modified copy:
-
-```bash
-cargo run -- --path C:\Users\you\Pictures --apply --keep newest-modified
-```
-
-Prefer copies inside a specific folder and exclude cache paths:
-
-```bash
-cargo run -- --path C:\Users\you\Photos --keep prefer-path --prefer-path C:\Users\you\Photos\Archive --exclude cache --exclude tmp
-```
-
-Resume a prior run from an explicit output directory:
-
-```bash
-cargo run -- --path C:\Users\you\Photos --output-dir output\photos-run --resume
-```
+- Safe by default: dry-run first
+- Byte-for-byte verification before deletion
+- Resumable checkpoint scanning
+- Keep-rule selection for conflict resolution
+- CSV outputs for auditability
+- Optional CLI fallback for automation
 
 ## Output Files
 
-Each run writes its artifacts into the chosen output directory. By default, that is a timestamped folder under `output/`.
+Each run writes into the selected output folder.
 
 Generated files include:
 
-- `all_files.csv`: every successfully scanned file
-- `kept_files.csv`: the files selected to keep
-- `planned_deletions.csv`: duplicate files that would be deleted
-- `deleted_files.csv`: files actually deleted during `--apply`
-- `failed_deletions.csv`: deletions that failed during `--apply`
-- `summary.txt`: human-readable run summary
-- `checkpoints/checkpoint_*.csv`: resumable scan batches
-
-## Keep Rules
-
-- `oldest-created`: keep the file with the oldest creation timestamp
-- `newest-modified`: keep the file with the newest modification timestamp
-- `prefer-path`: keep files under a preferred directory first, then break ties by oldest creation time
+- `all_files.csv`
+- `kept_files.csv`
+- `planned_deletions.csv`
+- `deleted_files.csv`
+- `failed_deletions.csv`
+- `summary.txt`
+- `checkpoints/checkpoint_*.csv`
 
 ## Development
+
+Main desktop app:
+
+```bash
+cargo run
+```
+
+Optional CLI:
+
+```bash
+cargo run --bin cli -- --path <directory> [options]
+```
 
 Format the code:
 
@@ -127,16 +82,10 @@ Format the code:
 cargo fmt --all
 ```
 
-Lint the code:
+Compile-check locally once the Rust desktop linker/toolchain is installed:
 
 ```bash
-cargo clippy --all-targets --all-features -- -D warnings
-```
-
-Run tests:
-
-```bash
-cargo test --all-targets --all-features
+cargo check --all-targets
 ```
 
 ## Project Layout
@@ -155,6 +104,9 @@ cargo test --all-targets --all-features
 |   |-- main.py
 |   `-- parallel_main.py
 |-- src/
+|   |-- bin/
+|   |   `-- cli.rs
+|   |-- gui.rs
 |   |-- lib.rs
 |   `-- main.rs
 `-- tests/fixtures/
@@ -164,10 +116,10 @@ cargo test --all-targets --all-features
 
 ## Notes
 
-- The Rust binary is the primary implementation.
-- The Python scripts are legacy prototypes and are not wired into CI.
-- If your output directory already exists and is not empty, the CLI will stop unless you pass `--resume`.
-- The current include/exclude filters use simple case-insensitive substring matching.
+- The GUI is the primary product surface now.
+- The Python scripts in `legacy/` are reference-only.
+- The app writes reports to the chosen output folder and can reuse them with resume/apply flows.
+- The local environment used for development may still need the MSVC linker (`link.exe`) installed before full Cargo builds succeed on Windows.
 
 ## License
 
