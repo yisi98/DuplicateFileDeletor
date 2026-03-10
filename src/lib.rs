@@ -913,4 +913,3 @@ fn canonicalize_or_original(path: &Path) -> Result<PathBuf> {
 fn system_time_to_unix(value: SystemTime) -> Result<i64> {
     Ok(value.duration_since(UNIX_EPOCH)?.as_secs() as i64)
 }
-
