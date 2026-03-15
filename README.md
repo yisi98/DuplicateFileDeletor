@@ -14,6 +14,7 @@ The desktop app provides:
 
 - Native folder pickers for the scan root, output folder, and preferred keep path
 - A review-first workflow with a dedicated dry-run action
+- A default-on fast prefilter that only hashes files sharing the same size
 - Progress updates while scanning, planning, and deleting
 - A modern dashboard with summary cards and an in-app review list
 - One-click access to the scanned folder and generated reports
@@ -25,6 +26,8 @@ A CLI is still available as a secondary entry point:
 cargo run --bin cli -- --path C:\Users\you\Pictures
 ```
 
+Add `--hash-all-files` if you want to disable the fast prefilter and force hashing for every file.
+
 ## Desktop Workflow
 
 1. Launch the app with `cargo run`.
@@ -35,13 +38,15 @@ cargo run --bin cli -- --path C:\Users\you\Pictures
    - newest modified
    - prefer a specific folder
 5. Optionally add include or exclude filters.
-6. Click `Plan Safe Dry Run`.
-7. Review the planned deletions inside the app.
-8. Click `Apply Current Plan` when you are satisfied.
+6. Leave the fast prefilter enabled for the fastest safe scan, or untick it to hash every file.
+7. Click `Plan Safe Dry Run`.
+8. Review the planned deletions inside the app.
+9. Click `Apply Current Plan` when you are satisfied.
 
 ## Features
 
 - Safe by default: dry-run first
+- Fast by default: same-size prefilter before hashing
 - Byte-for-byte verification before deletion
 - Resumable checkpoint scanning
 - Keep-rule selection for conflict resolution

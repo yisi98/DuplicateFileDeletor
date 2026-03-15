@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufReader, Read},
+    io::{BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,6 +23,7 @@ pub const DELETED_FILES_CSV: &str = "deleted_files.csv";
 pub const FAILED_DELETIONS_CSV: &str = "failed_deletions.csv";
 pub const SUMMARY_TXT: &str = "summary.txt";
 pub const DEFAULT_CHECKPOINT_INTERVAL: usize = 500;
+pub const SAMPLE_FINGERPRINT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileInfo {
@@ -86,6 +87,7 @@ pub struct RunConfig {
     pub output_dir: PathBuf,
     pub mode: OperationMode,
     pub keep_rule: KeepRule,
+    pub fast_prefilter: bool,
     pub include_filters: Vec<String>,
     pub exclude_filters: Vec<String>,
     pub resume: bool,
@@ -122,6 +124,7 @@ pub enum RunStage {
     Preparing,
     Discovering,
     Scanning,
+    Hashing,
     Planning,
     Deleting,
     Saving,
@@ -172,6 +175,7 @@ impl RunConfig {
         let mut mode = OperationMode::DryRun;
         let mut keep_name = "oldest-created".to_string();
         let mut prefer_path: Option<PathBuf> = None;
+        let mut fast_prefilter = true;
         let mut include_filters = Vec::new();
         let mut exclude_filters = Vec::new();
         let mut resume = false;
@@ -197,6 +201,7 @@ impl RunConfig {
                         &binary,
                     )?))
                 }
+                "--hash-all-files" => fast_prefilter = false,
                 "--include" => include_filters.push(next_value(&mut iter, "--include", &binary)?),
                 "--exclude" => exclude_filters.push(next_value(&mut iter, "--exclude", &binary)?),
                 "--apply" => mode = OperationMode::Apply,
@@ -213,6 +218,7 @@ impl RunConfig {
                 value if value.starts_with("--prefer-path=") => {
                     prefer_path = Some(PathBuf::from(split_flag(value)))
                 }
+                value if value == "--fast-prefilter" => fast_prefilter = true,
                 value if value.starts_with("--include=") => include_filters.push(split_flag(value)),
                 value if value.starts_with("--exclude=") => exclude_filters.push(split_flag(value)),
                 value if value.starts_with('-') => {
@@ -247,6 +253,7 @@ impl RunConfig {
             output_dir,
             mode,
             keep_rule,
+            fast_prefilter,
             include_filters,
             exclude_filters,
             resume,
@@ -294,7 +301,7 @@ pub fn suggested_output_dir() -> Result<PathBuf> {
 }
 
 pub fn usage(binary: &str) -> String {
-    format!("Usage:\n  {binary} --path <directory> [options]\n  {binary} <directory> [options]\n\nOptions:\n  --apply                    Delete duplicate files after review\n  --dry-run                  Plan only (default)\n  --output-dir <dir>         Folder for reports and checkpoints\n  --resume                   Resume from an existing output directory\n  --keep <rule>              oldest-created | newest-modified | prefer-path\n  --prefer-path <dir>        Preferred directory for --keep prefer-path\n  --include <text>           Only scan paths containing this text\n  --exclude <text>           Skip paths containing this text\n  -h, --help                 Show help")
+    format!("Usage:\n  {binary} --path <directory> [options]\n  {binary} <directory> [options]\n\nOptions:\n  --apply                    Delete duplicate files after review\n  --dry-run                  Plan only (default)\n  --output-dir <dir>         Folder for reports and checkpoints\n  --resume                   Resume from an existing output directory\n  --keep <rule>              oldest-created | newest-modified | prefer-path\n  --prefer-path <dir>        Preferred directory for --keep prefer-path\n  --hash-all-files           Disable fast prefilter and hash every file\n  --include <text>           Only scan paths containing this text\n  --exclude <text>           Skip paths containing this text\n  -h, --help                 Show help")
 }
 
 pub fn run(config: &RunConfig) -> Result<RunArtifacts> {
@@ -477,7 +484,7 @@ where
         mut files,
         mut next_batch_index,
     } = if config.resume {
-        load_checkpoints(&config.output_dir)?
+        load_saved_files(&config.output_dir)?
     } else {
         LoadedCheckpoints::default()
     };
@@ -492,7 +499,10 @@ where
     if !already_scanned.is_empty() {
         emit(progress(
             RunStage::Scanning,
-            format!("Loaded {} files from checkpoints", already_scanned.len()),
+            format!(
+                "Loaded {} files from saved scan data",
+                already_scanned.len()
+            ),
             Some(already_scanned.len() + remaining.len()),
             already_scanned.len(),
             0,
@@ -503,9 +513,8 @@ where
     for chunk in remaining.chunks(config.checkpoint_interval) {
         let mut chunk_results: Vec<FileInfo> = chunk
             .par_iter()
-            .filter_map(|path| match process_file(path) {
-                Ok(Some(file)) => Some(file),
-                Ok(None) => None,
+            .filter_map(|path| match process_file_metadata(path) {
+                Ok(file) => Some(file),
                 Err(error) => {
                     warn!("Failed to process {}: {}", path.display(), error);
                     None
@@ -522,7 +531,7 @@ where
         emit(progress(
             RunStage::Scanning,
             format!(
-                "Scanned {} of {} files",
+                "Indexed {} of {} files",
                 files.len(),
                 files.len() + remaining.len().saturating_sub(files.len())
             ),
@@ -533,8 +542,22 @@ where
         ));
     }
 
+    populate_hashes(config, &mut files, emit)?;
     files.sort_by(|left, right| left.file_path.cmp(&right.file_path));
     Ok(files)
+}
+
+fn load_saved_files(output_dir: &Path) -> Result<LoadedCheckpoints> {
+    let all_files_path = output_dir.join(ALL_FILES_CSV);
+    if all_files_path.exists() {
+        let files = load_file_infos(&all_files_path)?;
+        return Ok(LoadedCheckpoints {
+            files,
+            next_batch_index: next_checkpoint_index(output_dir)?,
+        });
+    }
+
+    load_checkpoints(output_dir)
 }
 
 fn load_checkpoints(output_dir: &Path) -> Result<LoadedCheckpoints> {
@@ -545,7 +568,6 @@ fn load_checkpoints(output_dir: &Path) -> Result<LoadedCheckpoints> {
 
     let mut files = Vec::new();
     let mut seen = HashSet::new();
-    let mut next_batch_index = 0;
     let mut checkpoints = Vec::new();
     for entry in fs::read_dir(&checkpoint_dir)? {
         let entry = entry?;
@@ -557,7 +579,7 @@ fn load_checkpoints(output_dir: &Path) -> Result<LoadedCheckpoints> {
     checkpoints.sort_by_key(|(index, _)| *index);
 
     for (index, path) in checkpoints {
-        next_batch_index = next_batch_index.max(index + 1);
+        let _ = index;
         let mut reader = Reader::from_path(path)?;
         for record in reader.deserialize() {
             let file: FileInfo = record?;
@@ -569,11 +591,36 @@ fn load_checkpoints(output_dir: &Path) -> Result<LoadedCheckpoints> {
 
     Ok(LoadedCheckpoints {
         files,
-        next_batch_index,
+        next_batch_index: next_checkpoint_index(output_dir)?,
     })
 }
 
-fn process_file(path: &Path) -> Result<Option<FileInfo>> {
+fn next_checkpoint_index(output_dir: &Path) -> Result<usize> {
+    let checkpoint_dir = output_dir.join(CHECKPOINT_DIR);
+    if !checkpoint_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut next_batch_index = 0;
+    for entry in fs::read_dir(&checkpoint_dir)? {
+        let entry = entry?;
+        if let Some(index) = checkpoint_index(&entry.path()) {
+            next_batch_index = next_batch_index.max(index + 1);
+        }
+    }
+    Ok(next_batch_index)
+}
+
+fn load_file_infos(path: &Path) -> Result<Vec<FileInfo>> {
+    let mut files = Vec::new();
+    let mut reader = Reader::from_path(path)?;
+    for record in reader.deserialize() {
+        files.push(record?);
+    }
+    Ok(files)
+}
+
+fn process_file_metadata(path: &Path) -> Result<FileInfo> {
     let metadata = fs::metadata(path)?;
     let file_name = path
         .file_name()
@@ -582,22 +629,219 @@ fn process_file(path: &Path) -> Result<Option<FileInfo>> {
         .to_string();
     let created_time = system_time_to_unix(metadata.created().or_else(|_| metadata.modified())?)?;
     let modified_time = system_time_to_unix(metadata.modified().or_else(|_| metadata.created())?)?;
-    let xxhash = match get_xxhash(path) {
-        Ok(hash) => hash,
-        Err(error) => {
-            warn!("Failed to hash {}: {}", path.display(), error);
-            return Ok(None);
-        }
-    };
 
-    Ok(Some(FileInfo {
+    Ok(FileInfo {
         file_path: path_to_string(path),
         file_size: metadata.len(),
-        xxhash,
+        xxhash: String::new(),
         created_time,
         modified_time,
         file_name,
-    }))
+    })
+}
+
+fn populate_hashes<F>(config: &RunConfig, files: &mut [FileInfo], emit: &mut F) -> Result<()>
+where
+    F: FnMut(ProgressUpdate),
+{
+    if !config.fast_prefilter {
+        let hash_targets = files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| file.xxhash.is_empty().then_some(index))
+            .collect::<Vec<_>>();
+        return apply_full_hashes(
+            files,
+            &hash_targets,
+            "Hashing all indexed files",
+            config,
+            emit,
+        );
+    }
+
+    let size_groups = collect_same_size_groups(files);
+    let sample_targets = size_groups
+        .values()
+        .flat_map(|indexes| indexes.iter().copied())
+        .filter(|index| files[*index].xxhash.is_empty())
+        .collect::<Vec<_>>();
+    if sample_targets.is_empty() {
+        return Ok(());
+    }
+
+    emit(progress(
+        RunStage::Hashing,
+        "Fingerprinting same-size candidates",
+        Some(sample_targets.len()),
+        0,
+        0,
+        0,
+    ));
+
+    let mut fingerprints = Vec::with_capacity(sample_targets.len());
+    let mut fingerprinted = 0usize;
+    for chunk in sample_targets.chunks(config.checkpoint_interval) {
+        let chunk_results: Vec<(usize, Option<String>)> = chunk
+            .par_iter()
+            .map(|index| {
+                let file = &files[*index];
+                match get_sample_fingerprint(Path::new(&file.file_path), file.file_size) {
+                    Ok(fingerprint) => (*index, Some(fingerprint)),
+                    Err(error) => {
+                        warn!("Failed to fingerprint {}: {}", file.file_path, error);
+                        (*index, None)
+                    }
+                }
+            })
+            .collect();
+
+        fingerprints.extend(chunk_results);
+        fingerprinted += chunk.len();
+        emit(progress(
+            RunStage::Hashing,
+            format!(
+                "Fingerprinted {} of {} same-size candidates",
+                fingerprinted,
+                sample_targets.len()
+            ),
+            Some(sample_targets.len()),
+            fingerprinted,
+            0,
+            0,
+        ));
+    }
+
+    let full_hash_targets = collect_full_hash_targets(files, fingerprints);
+    apply_full_hashes(
+        files,
+        &full_hash_targets,
+        "Hashing fingerprint matches",
+        config,
+        emit,
+    )
+}
+
+fn collect_same_size_groups(files: &[FileInfo]) -> HashMap<u64, Vec<usize>> {
+    let mut groups: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (index, file) in files.iter().enumerate() {
+        if file.xxhash.is_empty() {
+            groups.entry(file.file_size).or_default().push(index);
+        }
+    }
+    groups.retain(|_, indexes| indexes.len() > 1);
+    groups
+}
+
+fn collect_full_hash_targets(
+    files: &[FileInfo],
+    fingerprints: Vec<(usize, Option<String>)>,
+) -> Vec<usize> {
+    let mut fingerprint_groups: HashMap<(u64, String), Vec<usize>> = HashMap::new();
+    for (index, fingerprint) in fingerprints {
+        let Some(fingerprint) = fingerprint else {
+            continue;
+        };
+        fingerprint_groups
+            .entry((files[index].file_size, fingerprint))
+            .or_default()
+            .push(index);
+    }
+
+    let mut targets = Vec::new();
+    for indexes in fingerprint_groups.into_values() {
+        if indexes.len() < 2 {
+            continue;
+        }
+        targets.extend(indexes);
+    }
+    targets.sort_unstable();
+    targets
+}
+
+fn apply_full_hashes<F>(
+    files: &mut [FileInfo],
+    hash_targets: &[usize],
+    initial_message: &str,
+    config: &RunConfig,
+    emit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(ProgressUpdate),
+{
+    if hash_targets.is_empty() {
+        return Ok(());
+    }
+
+    emit(progress(
+        RunStage::Hashing,
+        initial_message,
+        Some(hash_targets.len()),
+        0,
+        0,
+        0,
+    ));
+
+    let mut hashed = 0usize;
+    for chunk in hash_targets.chunks(config.checkpoint_interval) {
+        let chunk_results: Vec<(usize, Option<String>)> = chunk
+            .par_iter()
+            .map(|index| {
+                let file = &files[*index];
+                match get_xxhash(Path::new(&file.file_path)) {
+                    Ok(hash) => (*index, Some(hash)),
+                    Err(error) => {
+                        warn!("Failed to hash {}: {}", file.file_path, error);
+                        (*index, None)
+                    }
+                }
+            })
+            .collect();
+
+        for (index, hash) in chunk_results {
+            if let Some(hash) = hash {
+                files[index].xxhash = hash;
+            }
+        }
+
+        hashed += chunk.len();
+        emit(progress(
+            RunStage::Hashing,
+            format!(
+                "Hashed {} of {} candidate files",
+                hashed,
+                hash_targets.len()
+            ),
+            Some(hash_targets.len()),
+            hashed,
+            0,
+            0,
+        ));
+    }
+
+    Ok(())
+}
+
+fn get_sample_fingerprint(file_path: &Path, file_size: u64) -> Result<String> {
+    let mut hasher = Xxh3::new();
+    let mut file = File::open(file_path).context("Failed to open file for fingerprinting")?;
+
+    if file_size <= (SAMPLE_FINGERPRINT_BYTES as u64) * 2 {
+        let mut buffer = vec![0_u8; SAMPLE_FINGERPRINT_BYTES.min(file_size as usize)];
+        file.read_exact(&mut buffer)?;
+        hasher.update(&buffer);
+        return Ok(format!("{:x}", hasher.digest()));
+    }
+
+    let mut first = vec![0_u8; SAMPLE_FINGERPRINT_BYTES];
+    file.read_exact(&mut first)?;
+    hasher.update(&first);
+
+    file.seek(SeekFrom::End(-(SAMPLE_FINGERPRINT_BYTES as i64)))?;
+    let mut last = vec![0_u8; SAMPLE_FINGERPRINT_BYTES];
+    file.read_exact(&mut last)?;
+    hasher.update(&last);
+
+    Ok(format!("{:x}", hasher.digest()))
 }
 
 fn get_xxhash(file_path: &Path) -> Result<String> {
@@ -623,14 +867,19 @@ fn save_checkpoint_batch(batch: &[FileInfo], index: usize, output_dir: &Path) ->
 
 fn plan_deletions(files: &[FileInfo], keep_rule: &KeepRule) -> Result<DedupPlan> {
     let mut groups: HashMap<(u64, String), Vec<FileInfo>> = HashMap::new();
+    let mut kept = Vec::new();
+
     for file in files.iter().cloned() {
+        if file.xxhash.is_empty() {
+            kept.push(file);
+            continue;
+        }
         groups
             .entry((file.file_size, file.xxhash.clone()))
             .or_default()
             .push(file);
     }
 
-    let mut kept = Vec::new();
     let mut planned_deletions = Vec::new();
     let mut duplicate_sets = 0;
 
@@ -912,4 +1161,177 @@ fn canonicalize_or_original(path: &Path) -> Result<PathBuf> {
 
 fn system_time_to_unix(value: SystemTime) -> Result<i64> {
     Ok(value.duration_since(UNIX_EPOCH)?.as_secs() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn fast_prefilter_only_hashes_same_size_groups() -> Result<()> {
+        let root_dir = create_temp_dir("fast_prefilter_root")?;
+        let output_dir = create_temp_dir("fast_prefilter_output")?;
+
+        fs::write(root_dir.join("a.txt"), b"same")?;
+        fs::write(root_dir.join("b.txt"), b"same")?;
+        fs::write(root_dir.join("c.txt"), b"diff")?;
+        fs::write(root_dir.join("d.txt"), b"unique-size")?;
+
+        let config = RunConfig {
+            root_dir: root_dir.clone(),
+            output_dir: output_dir.clone(),
+            mode: OperationMode::DryRun,
+            keep_rule: KeepRule::OldestCreated,
+            fast_prefilter: true,
+            include_filters: Vec::new(),
+            exclude_filters: Vec::new(),
+            resume: false,
+            checkpoint_interval: 2,
+        };
+
+        let artifacts = run(&config)?;
+        let unique = artifacts
+            .all_files
+            .iter()
+            .find(|file| file.file_name == "d.txt")
+            .expect("unique file should be scanned");
+        assert!(unique.xxhash.is_empty());
+        assert_eq!(artifacts.summary.planned_deletions, 1);
+
+        cleanup_temp_dir(&root_dir);
+        cleanup_temp_dir(&output_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn hash_all_files_mode_hashes_unique_sizes_too() -> Result<()> {
+        let root_dir = create_temp_dir("hash_all_root")?;
+        let output_dir = create_temp_dir("hash_all_output")?;
+
+        fs::write(root_dir.join("a.txt"), b"same")?;
+        fs::write(root_dir.join("b.txt"), b"same")?;
+        fs::write(root_dir.join("d.txt"), b"unique-size")?;
+
+        let config = RunConfig {
+            root_dir: root_dir.clone(),
+            output_dir: output_dir.clone(),
+            mode: OperationMode::DryRun,
+            keep_rule: KeepRule::OldestCreated,
+            fast_prefilter: false,
+            include_filters: Vec::new(),
+            exclude_filters: Vec::new(),
+            resume: false,
+            checkpoint_interval: 2,
+        };
+
+        let artifacts = run(&config)?;
+        let unique = artifacts
+            .all_files
+            .iter()
+            .find(|file| file.file_name == "d.txt")
+            .expect("unique file should be scanned");
+        assert!(!unique.xxhash.is_empty());
+
+        cleanup_temp_dir(&root_dir);
+        cleanup_temp_dir(&output_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn fast_prefilter_skips_full_hash_when_same_size_files_fingerprint_differ() -> Result<()> {
+        let root_dir = create_temp_dir("fingerprint_skip_root")?;
+        let output_dir = create_temp_dir("fingerprint_skip_output")?;
+
+        fs::write(root_dir.join("a.txt"), b"abcd")?;
+        fs::write(root_dir.join("b.txt"), b"wxyz")?;
+
+        let config = RunConfig {
+            root_dir: root_dir.clone(),
+            output_dir: output_dir.clone(),
+            mode: OperationMode::DryRun,
+            keep_rule: KeepRule::OldestCreated,
+            fast_prefilter: true,
+            include_filters: Vec::new(),
+            exclude_filters: Vec::new(),
+            resume: false,
+            checkpoint_interval: 2,
+        };
+
+        let artifacts = run(&config)?;
+        assert_eq!(artifacts.summary.planned_deletions, 0);
+        assert!(artifacts
+            .all_files
+            .iter()
+            .all(|file| file.xxhash.is_empty()));
+
+        cleanup_temp_dir(&root_dir);
+        cleanup_temp_dir(&output_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn fast_prefilter_falls_back_to_full_hash_when_samples_match() -> Result<()> {
+        let root_dir = create_temp_dir("fingerprint_match_root")?;
+        let output_dir = create_temp_dir("fingerprint_match_output")?;
+
+        let first = vec![b'a'; SAMPLE_FINGERPRINT_BYTES];
+        let middle_left = vec![b'x'; 1024];
+        let middle_right = vec![b'y'; 1024];
+        let last = vec![b'z'; SAMPLE_FINGERPRINT_BYTES];
+
+        let mut left = Vec::new();
+        left.extend_from_slice(&first);
+        left.extend_from_slice(&middle_left);
+        left.extend_from_slice(&last);
+
+        let mut right = Vec::new();
+        right.extend_from_slice(&first);
+        right.extend_from_slice(&middle_right);
+        right.extend_from_slice(&last);
+
+        fs::write(root_dir.join("left.bin"), &left)?;
+        fs::write(root_dir.join("right.bin"), &right)?;
+
+        let config = RunConfig {
+            root_dir: root_dir.clone(),
+            output_dir: output_dir.clone(),
+            mode: OperationMode::DryRun,
+            keep_rule: KeepRule::OldestCreated,
+            fast_prefilter: true,
+            include_filters: Vec::new(),
+            exclude_filters: Vec::new(),
+            resume: false,
+            checkpoint_interval: 2,
+        };
+
+        let artifacts = run(&config)?;
+        assert_eq!(artifacts.summary.planned_deletions, 0);
+        assert!(artifacts
+            .all_files
+            .iter()
+            .all(|file| !file.xxhash.is_empty()));
+
+        cleanup_temp_dir(&root_dir);
+        cleanup_temp_dir(&output_dir);
+        Ok(())
+    }
+
+    fn create_temp_dir(prefix: &str) -> Result<PathBuf> {
+        let path = std::env::temp_dir().join(format!(
+            "duplicate_file_deletor_{prefix}_{}",
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        if path.exists() {
+            fs::remove_dir_all(&path)?;
+        }
+        fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+
+    fn cleanup_temp_dir(path: &Path) {
+        let _ = fs::remove_dir_all(path);
+    }
 }
