@@ -1,12 +1,17 @@
 use duplicate_file_deletor::{
     suggested_output_dir, FileInfo, KeepRule, OperationMode, ProgressUpdate, RunArtifacts,
-    RunConfig, DEFAULT_CHECKPOINT_INTERVAL,
+    RunConfig, RunStage,
 };
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, Vec2,
 };
-use std::{path::Path, process::Command, sync::mpsc, thread, time::Instant};
-
+use std::{
+    path::Path,
+    process::Command,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 pub struct DedupeApp {
     form: RunForm,
     active_run: Option<ActiveRun>,
@@ -26,6 +31,8 @@ enum UiMessage {
     Progress(ProgressUpdate),
     Finished(Box<Result<RunArtifacts, String>>, RunConfig),
 }
+
+const GUI_PROGRESS_INTERVAL: usize = 100;
 
 #[derive(Clone)]
 struct RunForm {
@@ -241,22 +248,33 @@ impl DedupeApp {
 
             ui.add_space(8.0);
             ui.label(RichText::new(&self.status_message).color(Color32::from_rgb(180, 190, 208)));
-            if let Some(progress) = &self.latest_progress {
-                let fraction = progress.discovered_files.and_then(|total| {
-                    if total > 0 {
-                        Some(progress.processed_files as f32 / total as f32)
+
+            let elapsed = self.active_run.as_ref().map(|run| run.started_at.elapsed());
+            if running || self.latest_progress.is_some() {
+                let progress = self.latest_progress.as_ref();
+                ui.add(
+                    egui::ProgressBar::new(progress_fraction(progress, running))
+                        .desired_width(ui.available_width())
+                        .text(progress_bar_text(progress, running)),
+                );
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(progress) = progress {
+                        info_pill(ui, format!("Stage: {}", run_stage_label(progress.stage)));
+                        info_pill(ui, progress_counts_text(progress));
                     } else {
-                        None
+                        info_pill(ui, "Stage: starting".to_string());
+                    }
+
+                    if let Some(elapsed) = elapsed {
+                        info_pill(ui, format!("Elapsed: {}", format_duration(elapsed)));
+                        let eta = progress
+                            .and_then(|progress| progress_eta(progress, elapsed))
+                            .map(format_duration)
+                            .unwrap_or_else(|| "Estimating...".to_string());
+                        info_pill(ui, format!("ETA: {eta}"));
                     }
                 });
-                if let Some(fraction) = fraction {
-                    ui.add(
-                        egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
-                            .text(progress.message.clone()),
-                    );
-                } else {
-                    ui.label(progress.message.clone());
-                }
             }
         });
 
@@ -385,7 +403,7 @@ impl DedupeApp {
                     OperationMode::DryRun => "Planning duplicates...".to_string(),
                     OperationMode::Apply => "Applying deletion workflow...".to_string(),
                 };
-                self.latest_progress = None;
+                self.latest_progress = Some(starting_progress(mode));
                 self.active_run = Some(ActiveRun {
                     rx,
                     started_at: Instant::now(),
@@ -415,7 +433,7 @@ impl DedupeApp {
             let _ = tx.send(UiMessage::Finished(Box::new(result), config_for_thread));
         });
         self.status_message = "Applying current plan...".to_string();
-        self.latest_progress = None;
+        self.latest_progress = Some(starting_progress(OperationMode::Apply));
         self.active_run = Some(ActiveRun {
             rx,
             started_at: Instant::now(),
@@ -447,7 +465,7 @@ impl DedupeApp {
             include_filters: split_filters(&self.form.include_filters),
             exclude_filters: split_filters(&self.form.exclude_filters),
             resume: force_resume || self.form.resume,
-            checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+            checkpoint_interval: GUI_PROGRESS_INTERVAL,
         };
         config.validate().map_err(|error| error.to_string())?;
         Ok(config)
@@ -502,6 +520,152 @@ impl DedupeApp {
     }
 }
 
+fn starting_progress(mode: OperationMode) -> ProgressUpdate {
+    ProgressUpdate {
+        stage: RunStage::Preparing,
+        message: match mode {
+            OperationMode::DryRun => "Starting dry run...".to_string(),
+            OperationMode::Apply => "Starting apply run...".to_string(),
+        },
+        discovered_files: None,
+        processed_files: 0,
+        planned_deletions: 0,
+        deleted_files: 0,
+    }
+}
+
+fn progress_fraction(progress: Option<&ProgressUpdate>, is_running: bool) -> f32 {
+    let fraction = match progress {
+        Some(progress) => match progress.stage {
+            RunStage::Preparing => 0.04,
+            RunStage::Discovering => 0.08,
+            RunStage::Scanning => progress
+                .discovered_files
+                .filter(|total| *total > 0)
+                .map(|total| 0.10 + 0.55 * (progress.processed_files as f32 / total as f32))
+                .unwrap_or(0.15),
+            RunStage::Planning => 0.72,
+            RunStage::Deleting => {
+                if progress.planned_deletions > 0 {
+                    0.78 + 0.17
+                        * (progress.deleted_files as f32 / progress.planned_deletions as f32)
+                } else {
+                    0.82
+                }
+            }
+            RunStage::Saving => 0.96,
+            RunStage::Complete => 1.0,
+        },
+        None if is_running => 0.02,
+        None => 0.0,
+    };
+    fraction.clamp(0.0, 1.0)
+}
+
+fn progress_bar_text(progress: Option<&ProgressUpdate>, is_running: bool) -> String {
+    progress
+        .map(|progress| progress.message.clone())
+        .unwrap_or_else(|| {
+            if is_running {
+                "Starting background worker...".to_string()
+            } else {
+                "No active run".to_string()
+            }
+        })
+}
+
+fn run_stage_label(stage: RunStage) -> &'static str {
+    match stage {
+        RunStage::Preparing => "Preparing",
+        RunStage::Discovering => "Discovering",
+        RunStage::Scanning => "Scanning",
+        RunStage::Planning => "Planning",
+        RunStage::Deleting => "Deleting",
+        RunStage::Saving => "Saving",
+        RunStage::Complete => "Complete",
+    }
+}
+
+fn progress_counts_text(progress: &ProgressUpdate) -> String {
+    match progress.stage {
+        RunStage::Scanning => match progress.discovered_files {
+            Some(total) if total > 0 => format!("Files: {} / {}", progress.processed_files, total),
+            _ => format!("Files: {} scanned", progress.processed_files),
+        },
+        RunStage::Deleting => {
+            format!(
+                "Deleted: {} / {}",
+                progress.deleted_files, progress.planned_deletions
+            )
+        }
+        RunStage::Planning => format!("Scanned: {} files", progress.processed_files),
+        RunStage::Saving => format!(
+            "Planned: {} | Deleted: {}",
+            progress.planned_deletions, progress.deleted_files
+        ),
+        RunStage::Complete => format!(
+            "Scanned: {} | Deleted: {}",
+            progress.processed_files, progress.deleted_files
+        ),
+        _ => "Waiting for file counts".to_string(),
+    }
+}
+
+fn progress_eta(progress: &ProgressUpdate, elapsed: Duration) -> Option<Duration> {
+    let elapsed_secs = elapsed.as_secs_f32();
+    if elapsed_secs <= 0.0 {
+        return None;
+    }
+
+    match progress.stage {
+        RunStage::Scanning => {
+            let total = progress.discovered_files?;
+            if total == 0 || progress.processed_files == 0 || progress.processed_files >= total {
+                return None;
+            }
+            let per_second = progress.processed_files as f32 / elapsed_secs;
+            if per_second <= 0.0 {
+                return None;
+            }
+            let remaining = total.saturating_sub(progress.processed_files) as f32 / per_second;
+            Some(Duration::from_secs_f32(remaining.max(0.0)))
+        }
+        RunStage::Deleting => {
+            if progress.planned_deletions == 0
+                || progress.deleted_files == 0
+                || progress.deleted_files >= progress.planned_deletions
+            {
+                return None;
+            }
+            let per_second = progress.deleted_files as f32 / elapsed_secs;
+            if per_second <= 0.0 {
+                return None;
+            }
+            let remaining = progress
+                .planned_deletions
+                .saturating_sub(progress.deleted_files) as f32
+                / per_second;
+            Some(Duration::from_secs_f32(remaining.max(0.0)))
+        }
+        _ => None,
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    if total_seconds < 60 {
+        format!("{:.1}s", duration.as_secs_f32())
+    } else if total_seconds < 3_600 {
+        format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60)
+    } else {
+        format!(
+            "{:02}:{:02}:{:02}",
+            total_seconds / 3_600,
+            (total_seconds % 3_600) / 60,
+            total_seconds % 60
+        )
+    }
+}
 fn configure_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = Vec2::new(12.0, 12.0);
