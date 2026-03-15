@@ -42,6 +42,7 @@ struct RunForm {
     exclude_filters: String,
     keep_rule_index: usize,
     prefer_path: String,
+    fast_prefilter: bool,
     resume: bool,
 }
 
@@ -56,6 +57,7 @@ impl Default for DedupeApp {
                 exclude_filters: String::new(),
                 keep_rule_index: 0,
                 prefer_path: String::new(),
+                fast_prefilter: true,
                 resume: false,
             },
             active_run: None,
@@ -208,6 +210,15 @@ impl DedupeApp {
                 "Exclude filters",
                 &mut self.form.exclude_filters,
                 "Comma-separated substrings",
+            );
+            ui.checkbox(
+                &mut self.form.fast_prefilter,
+                "Fast prefilter: only hash files that share the same size",
+            );
+            ui.label(
+                RichText::new("This is faster and still verifies matches before deletion.")
+                    .small()
+                    .color(Color32::from_rgb(134, 148, 170)),
             );
             ui.checkbox(
                 &mut self.form.resume,
@@ -462,6 +473,7 @@ impl DedupeApp {
             output_dir: std::path::PathBuf::from(self.form.output_dir.trim()),
             mode,
             keep_rule,
+            fast_prefilter: self.form.fast_prefilter,
             include_filters: split_filters(&self.form.include_filters),
             exclude_filters: split_filters(&self.form.exclude_filters),
             resume: force_resume || self.form.resume,
@@ -542,15 +554,20 @@ fn progress_fraction(progress: Option<&ProgressUpdate>, is_running: bool) -> f32
             RunStage::Scanning => progress
                 .discovered_files
                 .filter(|total| *total > 0)
-                .map(|total| 0.10 + 0.55 * (progress.processed_files as f32 / total as f32))
+                .map(|total| 0.10 + 0.45 * (progress.processed_files as f32 / total as f32))
                 .unwrap_or(0.15),
-            RunStage::Planning => 0.72,
+            RunStage::Hashing => progress
+                .discovered_files
+                .filter(|total| *total > 0)
+                .map(|total| 0.58 + 0.18 * (progress.processed_files as f32 / total as f32))
+                .unwrap_or(0.62),
+            RunStage::Planning => 0.80,
             RunStage::Deleting => {
                 if progress.planned_deletions > 0 {
-                    0.78 + 0.17
+                    0.84 + 0.11
                         * (progress.deleted_files as f32 / progress.planned_deletions as f32)
                 } else {
-                    0.82
+                    0.88
                 }
             }
             RunStage::Saving => 0.96,
@@ -579,6 +596,7 @@ fn run_stage_label(stage: RunStage) -> &'static str {
         RunStage::Preparing => "Preparing",
         RunStage::Discovering => "Discovering",
         RunStage::Scanning => "Scanning",
+        RunStage::Hashing => "Hashing",
         RunStage::Planning => "Planning",
         RunStage::Deleting => "Deleting",
         RunStage::Saving => "Saving",
@@ -591,6 +609,10 @@ fn progress_counts_text(progress: &ProgressUpdate) -> String {
         RunStage::Scanning => match progress.discovered_files {
             Some(total) if total > 0 => format!("Files: {} / {}", progress.processed_files, total),
             _ => format!("Files: {} scanned", progress.processed_files),
+        },
+        RunStage::Hashing => match progress.discovered_files {
+            Some(total) if total > 0 => format!("Hashed: {} / {}", progress.processed_files, total),
+            _ => format!("Hashed: {}", progress.processed_files),
         },
         RunStage::Deleting => {
             format!(
@@ -619,6 +641,18 @@ fn progress_eta(progress: &ProgressUpdate, elapsed: Duration) -> Option<Duration
 
     match progress.stage {
         RunStage::Scanning => {
+            let total = progress.discovered_files?;
+            if total == 0 || progress.processed_files == 0 || progress.processed_files >= total {
+                return None;
+            }
+            let per_second = progress.processed_files as f32 / elapsed_secs;
+            if per_second <= 0.0 {
+                return None;
+            }
+            let remaining = total.saturating_sub(progress.processed_files) as f32 / per_second;
+            Some(Duration::from_secs_f32(remaining.max(0.0)))
+        }
+        RunStage::Hashing => {
             let total = progress.discovered_files?;
             if total == 0 || progress.processed_files == 0 || progress.processed_files >= total {
                 return None;
