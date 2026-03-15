@@ -218,7 +218,7 @@ impl RunConfig {
                 value if value.starts_with("--prefer-path=") => {
                     prefer_path = Some(PathBuf::from(split_flag(value)))
                 }
-                value if value == "--fast-prefilter" => fast_prefilter = true,
+                "--fast-prefilter" => fast_prefilter = true,
                 value if value.starts_with("--include=") => include_filters.push(split_flag(value)),
                 value if value.starts_with("--exclude=") => exclude_filters.push(split_flag(value)),
                 value if value.starts_with('-') => {
