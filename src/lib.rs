@@ -90,6 +90,8 @@ pub struct RunConfig {
     pub fast_prefilter: bool,
     pub include_filters: Vec<String>,
     pub exclude_filters: Vec<String>,
+    pub follow_symlinks: bool,
+    pub use_trash: bool,
     pub resume: bool,
     pub checkpoint_interval: usize,
 }
@@ -178,6 +180,8 @@ impl RunConfig {
         let mut fast_prefilter = true;
         let mut include_filters = Vec::new();
         let mut exclude_filters = Vec::new();
+        let mut follow_symlinks = false;
+        let mut use_trash = false;
         let mut resume = false;
 
         while let Some(arg) = iter.next() {
@@ -207,6 +211,8 @@ impl RunConfig {
                 "--apply" => mode = OperationMode::Apply,
                 "--dry-run" => mode = OperationMode::DryRun,
                 "--resume" => resume = true,
+                "--follow-symlinks" => follow_symlinks = true,
+                "--use-trash" => use_trash = true,
                 value if value.starts_with("--path=") => {
                     root_dir = Some(PathBuf::from(split_flag(value)))
                 }
@@ -256,6 +262,8 @@ impl RunConfig {
             fast_prefilter,
             include_filters,
             exclude_filters,
+            follow_symlinks,
+            use_trash,
             resume,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
         };
@@ -301,7 +309,7 @@ pub fn suggested_output_dir() -> Result<PathBuf> {
 }
 
 pub fn usage(binary: &str) -> String {
-    format!("Usage:\n  {binary} --path <directory> [options]\n  {binary} <directory> [options]\n\nOptions:\n  --apply                    Delete duplicate files after review\n  --dry-run                  Plan only (default)\n  --output-dir <dir>         Folder for reports and checkpoints\n  --resume                   Resume from an existing output directory\n  --keep <rule>              oldest-created | newest-modified | prefer-path\n  --prefer-path <dir>        Preferred directory for --keep prefer-path\n  --hash-all-files           Disable fast prefilter and hash every file\n  --include <text>           Only scan paths containing this text\n  --exclude <text>           Skip paths containing this text\n  -h, --help                 Show help")
+    format!("Usage:\n  {binary} --path <directory> [options]\n  {binary} <directory> [options]\n\nOptions:\n  --apply                    Delete duplicate files after review\n  --dry-run                  Plan only (default)\n  --output-dir <dir>         Folder for reports and checkpoints\n  --resume                   Resume from an existing output directory\n  --keep <rule>              oldest-created | newest-modified | prefer-path\n  --prefer-path <dir>        Preferred directory for --keep prefer-path\n  --hash-all-files           Disable fast prefilter and hash every file\n  --include <text>           Only scan paths containing this text\n  --exclude <text>           Skip paths containing this text\n  --follow-symlinks          Follow symbolic links during traversal\n  --use-trash                Move deleted files to the system trash instead of permanent deletion\n  -h, --help                 Show help")
 }
 
 pub fn run(config: &RunConfig) -> Result<RunArtifacts> {
@@ -378,7 +386,9 @@ where
             deleted: Vec::new(),
             failed: Vec::new(),
         },
-        OperationMode::Apply => execute_deletions(&plan.planned_deletions, &mut emit)?,
+        OperationMode::Apply => {
+            execute_deletions(&plan.planned_deletions, config.use_trash, &mut emit)?
+        }
     };
 
     if config.mode == OperationMode::Apply {
@@ -456,12 +466,16 @@ fn discover_candidate_files(config: &RunConfig) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in WalkDir::new(&config.root_dir)
         .sort_by_file_name()
+        .follow_links(config.follow_symlinks)
         .into_iter()
         .filter_entry(|entry| !is_output_path(entry.path(), &output_dir))
         .filter_map(|entry| entry.ok())
     {
         let path = entry.path();
         if !entry.file_type().is_file() || is_output_path(path, &output_dir) {
+            continue;
+        }
+        if is_system_protected_path(path) {
             continue;
         }
         if !path_matches_filters(path, &config.include_filters, &config.exclude_filters) {
@@ -985,23 +999,43 @@ fn files_are_identical(left: &Path, right: &Path) -> Result<bool> {
     }
 }
 
-fn execute_deletions<F>(files: &[FileInfo], emit: &mut F) -> Result<DeletionOutcome>
+fn execute_deletions<F>(
+    files: &[FileInfo],
+    use_trash: bool,
+    emit: &mut F,
+) -> Result<DeletionOutcome>
 where
     F: FnMut(ProgressUpdate),
 {
+    let deletion_errors: Vec<Option<String>> = files
+        .par_iter()
+        .map(|file| {
+            let result = if use_trash {
+                trash::delete(&file.file_path).map_err(|e| e.to_string())
+            } else {
+                fs::remove_file(&file.file_path).map_err(|e| e.to_string())
+            };
+            result.err()
+        })
+        .collect();
+
     let mut deleted = Vec::new();
     let mut failed = Vec::new();
-    for (index, file) in files.iter().enumerate() {
-        match fs::remove_file(&file.file_path) {
-            Ok(()) => deleted.push(file.clone()),
-            Err(error) => failed.push(FailedDeletionRecord {
+    for (file, error) in files.iter().zip(deletion_errors) {
+        match error {
+            None => deleted.push(file.clone()),
+            Some(message) => failed.push(FailedDeletionRecord {
                 file_path: file.file_path.clone(),
-                error: error.to_string(),
+                error: message,
             }),
         }
         emit(progress(
             RunStage::Deleting,
-            format!("Applying deletion plan: {} of {}", index + 1, files.len()),
+            format!(
+                "Applying deletion plan: {} of {}",
+                deleted.len() + failed.len(),
+                files.len()
+            ),
             None,
             0,
             files.len(),
@@ -1121,13 +1155,15 @@ fn path_matches_filters(path: &Path, includes: &[String], excludes: &[String]) -
 fn is_output_path(candidate: &Path, output_dir: &Path) -> bool {
     let candidate = normalize_path(candidate);
     let output_dir = normalize_dir_prefix(output_dir);
-    candidate == output_dir.trim_end_matches('\\') || candidate.starts_with(&output_dir)
+    let sep = std::path::MAIN_SEPARATOR;
+    candidate == output_dir.trim_end_matches(sep) || candidate.starts_with(&output_dir)
 }
 
 fn normalize_dir_prefix(path: &Path) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
     let mut value = normalize_path(path);
-    if !value.ends_with('\\') {
-        value.push('\\');
+    if !value.ends_with(sep) {
+        value.push(sep);
     }
     value
 }
@@ -1137,7 +1173,26 @@ fn normalize_path(path: &Path) -> String {
 }
 
 fn normalize_path_string(value: &str) -> String {
-    value.replace('/', "\\").to_lowercase()
+    if cfg!(windows) {
+        value.replace('/', "\\").to_lowercase()
+    } else {
+        value.replace('\\', "/").to_lowercase()
+    }
+}
+
+fn is_system_protected_path(path: &Path) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let normalized = normalize_path(path);
+    const SYSTEM_PATTERNS: &[&str] = &[
+        r"\windows\system32",
+        r"\windows\syswow64",
+        r"\windows\winsxs",
+        "$recycle.bin",
+        "system volume information",
+    ];
+    SYSTEM_PATTERNS.iter().any(|p| normalized.contains(*p))
 }
 
 fn path_to_string(path: &Path) -> String {
@@ -1188,6 +1243,8 @@ mod tests {
             fast_prefilter: true,
             include_filters: Vec::new(),
             exclude_filters: Vec::new(),
+            follow_symlinks: false,
+            use_trash: false,
             resume: false,
             checkpoint_interval: 2,
         };
@@ -1223,6 +1280,8 @@ mod tests {
             fast_prefilter: false,
             include_filters: Vec::new(),
             exclude_filters: Vec::new(),
+            follow_symlinks: false,
+            use_trash: false,
             resume: false,
             checkpoint_interval: 2,
         };
@@ -1256,6 +1315,8 @@ mod tests {
             fast_prefilter: true,
             include_filters: Vec::new(),
             exclude_filters: Vec::new(),
+            follow_symlinks: false,
+            use_trash: false,
             resume: false,
             checkpoint_interval: 2,
         };
@@ -1303,6 +1364,8 @@ mod tests {
             fast_prefilter: true,
             include_filters: Vec::new(),
             exclude_filters: Vec::new(),
+            follow_symlinks: false,
+            use_trash: false,
             resume: false,
             checkpoint_interval: 2,
         };
@@ -1316,6 +1379,291 @@ mod tests {
 
         cleanup_temp_dir(&root_dir);
         cleanup_temp_dir(&output_dir);
+        Ok(())
+    }
+
+    // --- deletion ---
+
+    #[test]
+    fn apply_mode_deletes_duplicate_files() -> Result<()> {
+        let root_dir = create_temp_dir("apply_root")?;
+        let output_dir = create_temp_dir("apply_output")?;
+
+        fs::write(root_dir.join("a.txt"), b"duplicate content")?;
+        fs::write(root_dir.join("b.txt"), b"duplicate content")?;
+        fs::write(root_dir.join("c.txt"), b"unique")?;
+
+        let config = RunConfig {
+            root_dir: root_dir.clone(),
+            output_dir: output_dir.clone(),
+            mode: OperationMode::Apply,
+            keep_rule: KeepRule::OldestCreated,
+            fast_prefilter: true,
+            include_filters: Vec::new(),
+            exclude_filters: Vec::new(),
+            follow_symlinks: false,
+            use_trash: false,
+            resume: false,
+            checkpoint_interval: 100,
+        };
+
+        let artifacts = run(&config)?;
+        assert_eq!(artifacts.summary.deleted_files, 1);
+        assert_eq!(artifacts.summary.failed_deletions, 0);
+        let a_exists = root_dir.join("a.txt").exists();
+        let b_exists = root_dir.join("b.txt").exists();
+        assert!(
+            a_exists ^ b_exists,
+            "exactly one of a.txt/b.txt should be deleted"
+        );
+        assert!(
+            root_dir.join("c.txt").exists(),
+            "unique file should not be deleted"
+        );
+
+        cleanup_temp_dir(&root_dir);
+        cleanup_temp_dir(&output_dir);
+        Ok(())
+    }
+
+    // --- filters ---
+
+    #[test]
+    fn include_filter_restricts_scanned_files() -> Result<()> {
+        let root_dir = create_temp_dir("include_root")?;
+        let output_dir = create_temp_dir("include_output")?;
+
+        fs::write(root_dir.join("a.txt"), b"same")?;
+        fs::write(root_dir.join("b.txt"), b"same")?;
+        fs::write(root_dir.join("a.log"), b"same")?;
+
+        let config = RunConfig {
+            root_dir: root_dir.clone(),
+            output_dir: output_dir.clone(),
+            mode: OperationMode::DryRun,
+            keep_rule: KeepRule::OldestCreated,
+            fast_prefilter: true,
+            include_filters: vec![".txt".to_string()],
+            exclude_filters: Vec::new(),
+            follow_symlinks: false,
+            use_trash: false,
+            resume: false,
+            checkpoint_interval: 100,
+        };
+
+        let artifacts = run(&config)?;
+        assert!(
+            artifacts
+                .all_files
+                .iter()
+                .all(|f| f.file_name.ends_with(".txt")),
+            "only .txt files should be scanned"
+        );
+        assert_eq!(artifacts.summary.planned_deletions, 1);
+
+        cleanup_temp_dir(&root_dir);
+        cleanup_temp_dir(&output_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn exclude_filter_skips_matching_files() -> Result<()> {
+        let root_dir = create_temp_dir("exclude_root")?;
+        let output_dir = create_temp_dir("exclude_output")?;
+
+        fs::write(root_dir.join("a.txt"), b"same")?;
+        fs::write(root_dir.join("b.txt"), b"same")?;
+        fs::write(root_dir.join("skip_this.txt"), b"same")?;
+
+        let config = RunConfig {
+            root_dir: root_dir.clone(),
+            output_dir: output_dir.clone(),
+            mode: OperationMode::DryRun,
+            keep_rule: KeepRule::OldestCreated,
+            fast_prefilter: false,
+            include_filters: Vec::new(),
+            exclude_filters: vec!["skip_".to_string()],
+            follow_symlinks: false,
+            use_trash: false,
+            resume: false,
+            checkpoint_interval: 100,
+        };
+
+        let artifacts = run(&config)?;
+        assert!(
+            !artifacts
+                .all_files
+                .iter()
+                .any(|f| f.file_name.starts_with("skip_")),
+            "files matching exclude filter must not be scanned"
+        );
+
+        cleanup_temp_dir(&root_dir);
+        cleanup_temp_dir(&output_dir);
+        Ok(())
+    }
+
+    // --- keep rules ---
+
+    #[test]
+    fn keep_rule_newest_modified_keeps_most_recently_changed() -> Result<()> {
+        let root_dir = create_temp_dir("newest_mod_root")?;
+        let output_dir = create_temp_dir("newest_mod_output")?;
+
+        let content = b"identical bytes";
+        fs::write(root_dir.join("old.txt"), content)?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(root_dir.join("new.txt"), content)?;
+
+        let config = RunConfig {
+            root_dir: root_dir.clone(),
+            output_dir: output_dir.clone(),
+            mode: OperationMode::DryRun,
+            keep_rule: KeepRule::NewestModified,
+            fast_prefilter: false,
+            include_filters: Vec::new(),
+            exclude_filters: Vec::new(),
+            follow_symlinks: false,
+            use_trash: false,
+            resume: false,
+            checkpoint_interval: 100,
+        };
+
+        let artifacts = run(&config)?;
+        assert_eq!(artifacts.summary.planned_deletions, 1);
+        let deleted = &artifacts.planned_deletions[0];
+        assert_eq!(
+            deleted.file_name, "old.txt",
+            "oldest-modified file should be deleted, got {}",
+            deleted.file_name
+        );
+
+        cleanup_temp_dir(&root_dir);
+        cleanup_temp_dir(&output_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn keep_rule_prefer_path_keeps_file_in_preferred_dir() -> Result<()> {
+        let root_dir = create_temp_dir("prefer_path_root")?;
+        let output_dir = create_temp_dir("prefer_path_output")?;
+
+        let preferred = root_dir.join("preferred");
+        let other = root_dir.join("other");
+        fs::create_dir_all(&preferred)?;
+        fs::create_dir_all(&other)?;
+
+        let content = b"same content here";
+        fs::write(preferred.join("file.txt"), content)?;
+        fs::write(other.join("file.txt"), content)?;
+
+        let config = RunConfig {
+            root_dir: root_dir.clone(),
+            output_dir: output_dir.clone(),
+            mode: OperationMode::DryRun,
+            keep_rule: KeepRule::PreferPath(preferred.clone()),
+            fast_prefilter: false,
+            include_filters: Vec::new(),
+            exclude_filters: Vec::new(),
+            follow_symlinks: false,
+            use_trash: false,
+            resume: false,
+            checkpoint_interval: 100,
+        };
+
+        let artifacts = run(&config)?;
+        assert_eq!(artifacts.summary.planned_deletions, 1);
+        let kept = artifacts
+            .kept_files
+            .iter()
+            .find(|f| f.file_name == "file.txt")
+            .expect("kept file should exist");
+        assert!(
+            kept.file_path.to_lowercase().contains("preferred"),
+            "preferred path file should be kept, got {}",
+            kept.file_path
+        );
+
+        cleanup_temp_dir(&root_dir);
+        cleanup_temp_dir(&output_dir);
+        Ok(())
+    }
+
+    // --- resume ---
+
+    #[test]
+    fn resume_reuses_previously_scanned_files() -> Result<()> {
+        let root_dir = create_temp_dir("resume_root")?;
+        let output_dir = create_temp_dir("resume_output")?;
+
+        fs::write(root_dir.join("a.txt"), b"same")?;
+        fs::write(root_dir.join("b.txt"), b"same")?;
+        fs::write(root_dir.join("c.txt"), b"unique content xyz")?;
+
+        let config = RunConfig {
+            root_dir: root_dir.clone(),
+            output_dir: output_dir.clone(),
+            mode: OperationMode::DryRun,
+            keep_rule: KeepRule::OldestCreated,
+            fast_prefilter: false,
+            include_filters: Vec::new(),
+            exclude_filters: Vec::new(),
+            follow_symlinks: false,
+            use_trash: false,
+            resume: false,
+            checkpoint_interval: 1,
+        };
+        let first = run(&config)?;
+
+        let mut resume_config = config.clone();
+        resume_config.resume = true;
+        let second = run(&resume_config)?;
+
+        assert_eq!(
+            first.summary.planned_deletions, second.summary.planned_deletions,
+            "resumed run should produce the same plan as the original"
+        );
+
+        cleanup_temp_dir(&root_dir);
+        cleanup_temp_dir(&output_dir);
+        Ok(())
+    }
+
+    // --- CSV I/O ---
+
+    #[test]
+    fn csv_round_trip_preserves_all_fields() -> Result<()> {
+        let dir = create_temp_dir("csv_roundtrip")?;
+        let path = dir.join("files.csv");
+
+        let original = vec![
+            FileInfo {
+                file_path: "/tmp/a.txt".to_string(),
+                file_size: 42,
+                xxhash: "deadbeef".to_string(),
+                created_time: 1_000_000,
+                modified_time: 2_000_000,
+                file_name: "a.txt".to_string(),
+            },
+            FileInfo {
+                file_path: "/tmp/b.txt".to_string(),
+                file_size: 0,
+                xxhash: String::new(),
+                created_time: 3_000_000,
+                modified_time: 4_000_000,
+                file_name: "b.txt".to_string(),
+            },
+        ];
+
+        save_file_infos(&original, &path)?;
+        let loaded = load_file_infos(&path)?;
+
+        assert_eq!(original.len(), loaded.len());
+        for (expected, got) in original.iter().zip(loaded.iter()) {
+            assert_eq!(expected, got);
+        }
+
+        cleanup_temp_dir(&dir);
         Ok(())
     }
 

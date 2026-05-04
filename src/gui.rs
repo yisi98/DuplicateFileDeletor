@@ -43,6 +43,8 @@ struct RunForm {
     keep_rule_index: usize,
     prefer_path: String,
     fast_prefilter: bool,
+    follow_symlinks: bool,
+    use_trash: bool,
     resume: bool,
 }
 
@@ -58,6 +60,8 @@ impl Default for DedupeApp {
                 keep_rule_index: 0,
                 prefer_path: String::new(),
                 fast_prefilter: true,
+                follow_symlinks: false,
+                use_trash: true,
                 resume: false,
             },
             active_run: None,
@@ -220,10 +224,22 @@ impl DedupeApp {
                     .small()
                     .color(Color32::from_rgb(134, 148, 170)),
             );
+            ui.checkbox(&mut self.form.follow_symlinks, "Follow symbolic links");
+            ui.checkbox(
+                &mut self.form.use_trash,
+                "Move deleted files to system trash (safer, recoverable)",
+            );
             ui.checkbox(
                 &mut self.form.resume,
                 "Resume from checkpoints in the output folder",
             );
+            if let Some(status) = checkpoint_status_text(&self.form.output_dir) {
+                ui.label(
+                    RichText::new(status)
+                        .small()
+                        .color(Color32::from_rgb(92, 201, 144)),
+                );
+            }
         });
 
         card(ui, "Actions", |ui| {
@@ -476,6 +492,8 @@ impl DedupeApp {
             fast_prefilter: self.form.fast_prefilter,
             include_filters: split_filters(&self.form.include_filters),
             exclude_filters: split_filters(&self.form.exclude_filters),
+            follow_symlinks: self.form.follow_symlinks,
+            use_trash: self.form.use_trash,
             resume: force_resume || self.form.resume,
             checkpoint_interval: GUI_PROGRESS_INTERVAL,
         };
@@ -871,4 +889,20 @@ fn split_filters(value: &str) -> Vec<String> {
 fn open_in_file_manager(path: &Path) -> std::io::Result<()> {
     Command::new("explorer").arg(path).spawn()?;
     Ok(())
+}
+
+fn checkpoint_status_text(output_dir: &str) -> Option<String> {
+    use duplicate_file_deletor::{ALL_FILES_CSV, CHECKPOINT_DIR};
+    let base = std::path::Path::new(output_dir);
+    if base.join(ALL_FILES_CSV).exists() {
+        return Some("Full scan available — resume will reload it instantly".to_string());
+    }
+    let count = std::fs::read_dir(base.join(CHECKPOINT_DIR))
+        .map(|entries| entries.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    if count > 0 {
+        Some(format!("{count} checkpoint batch(es) available for resume"))
+    } else {
+        None
+    }
 }
