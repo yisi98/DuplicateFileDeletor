@@ -15,4 +15,5 @@ rayon = "1.7"
 rfd = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 walkdir = "2.3"
+trash = "3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
