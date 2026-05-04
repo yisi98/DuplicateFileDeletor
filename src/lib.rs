@@ -386,7 +386,9 @@ where
             deleted: Vec::new(),
             failed: Vec::new(),
         },
-        OperationMode::Apply => execute_deletions(&plan.planned_deletions, config.use_trash, &mut emit)?,
+        OperationMode::Apply => {
+            execute_deletions(&plan.planned_deletions, config.use_trash, &mut emit)?
+        }
     };
 
     if config.mode == OperationMode::Apply {
@@ -997,7 +999,11 @@ fn files_are_identical(left: &Path, right: &Path) -> Result<bool> {
     }
 }
 
-fn execute_deletions<F>(files: &[FileInfo], use_trash: bool, emit: &mut F) -> Result<DeletionOutcome>
+fn execute_deletions<F>(
+    files: &[FileInfo],
+    use_trash: bool,
+    emit: &mut F,
+) -> Result<DeletionOutcome>
 where
     F: FnMut(ProgressUpdate),
 {
@@ -1406,8 +1412,14 @@ mod tests {
         assert_eq!(artifacts.summary.failed_deletions, 0);
         let a_exists = root_dir.join("a.txt").exists();
         let b_exists = root_dir.join("b.txt").exists();
-        assert!(a_exists ^ b_exists, "exactly one of a.txt/b.txt should be deleted");
-        assert!(root_dir.join("c.txt").exists(), "unique file should not be deleted");
+        assert!(
+            a_exists ^ b_exists,
+            "exactly one of a.txt/b.txt should be deleted"
+        );
+        assert!(
+            root_dir.join("c.txt").exists(),
+            "unique file should not be deleted"
+        );
 
         cleanup_temp_dir(&root_dir);
         cleanup_temp_dir(&output_dir);
@@ -1441,7 +1453,10 @@ mod tests {
 
         let artifacts = run(&config)?;
         assert!(
-            artifacts.all_files.iter().all(|f| f.file_name.ends_with(".txt")),
+            artifacts
+                .all_files
+                .iter()
+                .all(|f| f.file_name.ends_with(".txt")),
             "only .txt files should be scanned"
         );
         assert_eq!(artifacts.summary.planned_deletions, 1);
@@ -1476,7 +1491,10 @@ mod tests {
 
         let artifacts = run(&config)?;
         assert!(
-            !artifacts.all_files.iter().any(|f| f.file_name.starts_with("skip_")),
+            !artifacts
+                .all_files
+                .iter()
+                .any(|f| f.file_name.starts_with("skip_")),
             "files matching exclude filter must not be scanned"
         );
 
